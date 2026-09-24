@@ -82,6 +82,13 @@ class PreviousPlacement(BaseModel):
     slot: int
 
 
+class MutexPairIn(BaseModel):
+    # 一对互斥试管的两个编号: 二者不得落在按角度环形排序后相邻的物理槽位
+    # (禁用槽仍占据相邻关系)。含互斥对的请求限至多 7 管、10 个启用槽、12 对。
+    tube_a: int
+    tube_b: int
+
+
 class TubeErrorIn(BaseModel):
     tube_id: int
     # 非负称重质量误差上界(g); 不得超过该管标称质量, 由校核逻辑按方案校验
@@ -147,6 +154,8 @@ class PlanRequest(BaseModel):
     seed: int = 20260923
     previous: Optional[list[PreviousPlacement]] = None
     parent_id: Optional[int] = None
+    # 互斥试管对(至多 12 对); 非空时后端改用精确完全枚举而非启发式搜索
+    mutex_pairs: list[MutexPairIn] = Field(default_factory=list)
     save: bool = True
 
 
@@ -214,6 +223,7 @@ def _build_payload(req: PlanRequest) -> dict[str, Any]:
         "previous": (
             [p.model_dump() for p in req.previous] if req.previous is not None else None
         ),
+        "mutex_pairs": [p.model_dump() for p in req.mutex_pairs],
     }
 
 

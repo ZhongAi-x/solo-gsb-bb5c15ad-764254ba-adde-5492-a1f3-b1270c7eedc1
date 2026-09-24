@@ -56,6 +56,7 @@ th{color:var(--mut);font-weight:500}
 .pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;border:1px solid var(--line)}
 .pill.lock{color:var(--lock);border-color:var(--lock)}
 .pill.move{color:var(--warn);border-color:var(--warn)}
+.pill.mutex{color:#fda4af;border-color:var(--bad)}
 #rotor{width:100%;max-width:420px;display:block;margin:0 auto;background:radial-gradient(circle at 50% 45%,#1a2540,#101726);
   border-radius:12px;border:1px solid var(--line)}
 .slot-node{cursor:pointer}
@@ -179,6 +180,24 @@ th{color:var(--mut);font-weight:500}
     </div>
 
     <div class="panel section">
+      <h2>互斥试管隔离 <span class="tag">至多 12 对; 含互斥对时限 7 管 / 10 启用槽, 精确搜索</span></h2>
+      <table id="mutexTable">
+        <thead><tr><th style="width:110px">试管 A</th><th></th><th style="width:110px">试管 B</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="rowline" style="margin-top:8px">
+        <button id="btnAddMutex">+ 添加互斥对</button>
+        <span class="small" id="mutexCount"></span>
+      </div>
+      <div class="small" style="margin-top:6px;line-height:1.55">
+        每对试管不得落在<b>按角度环形排序后相邻的物理槽位</b>(禁用槽仍占据相邻关系:
+        两个启用槽之间隔着禁用槽时不算相邻)。含互斥对时后端对全部合法摆放做<b>精确完全枚举</b>,
+        取现有评分(w₁·|U₁|² + w₂·|U₂|², 增量重排含移动罚权)最小值; 锁定管互斥冲突或无合法摆放时
+        明确返回<b>不可行且不保存方案</b>。不填互斥对时沿用原有启发式求解。
+      </div>
+    </div>
+
+    <div class="panel section">
       <h2>求解 / 增量重排</h2>
       <div class="grid3">
         <div><label>一阶权重 w₁</label><input id="w1" type="number" step="any" value="1"></div>
@@ -219,6 +238,8 @@ th{color:var(--mut);font-weight:500}
           <span><i style="background:var(--warn)"></i>本次移动</span>
           <span><i style="background:var(--acc)"></i>一阶合力 U₁</span>
           <span><i style="background:var(--acc2)"></i>二阶 U₂</span>
+          <span><i style="background:#6b7794"></i>物理相邻(环)</span>
+          <span><i style="background:#f87272"></i>互斥对连线</span>
         </div>
       </div>
       <div>
@@ -231,6 +252,7 @@ th{color:var(--mut);font-weight:500}
           <div class="metric"><div class="k">平衡评级</div><div class="v" id="mGrade">–</div></div>
         </div>
         <div id="summary" class="reason" style="margin-top:10px;display:none"></div>
+        <div id="mutexInfo" class="wc-note" style="margin-top:8px;display:none"></div>
       </div>
     </div>
 
@@ -257,7 +279,7 @@ th{color:var(--mut);font-weight:500}
       </div>
       <div id="tab-placements" style="display:none">
         <table id="placementTable">
-          <thead><tr><th>试管</th><th>质量(g)</th><th>槽位</th><th>角度</th><th>原槽</th><th>状态</th></tr></thead>
+          <thead><tr><th>试管</th><th>质量(g)</th><th>槽位</th><th>角度</th><th>原槽</th><th>互斥</th><th>状态</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>

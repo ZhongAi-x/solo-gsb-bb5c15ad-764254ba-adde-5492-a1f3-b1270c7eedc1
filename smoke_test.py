@@ -207,11 +207,20 @@ def _build_concrete(cls, data):
         o = types.SimpleNamespace(tube_id=int(d["tube_id"]), slot=int(d["slot"]))
         o.model_dump = lambda: {"tube_id": o.tube_id, "slot": o.slot}
         return o
+    def mpair(d):
+        if isinstance(d, dict):
+            a = d.get("tube_a", d.get("a")); b = d.get("tube_b", d.get("b"))
+        else:
+            a, b = d[0], d[1]
+        o = types.SimpleNamespace(tube_a=int(a), tube_b=int(b))
+        o.model_dump = lambda: {"tube_a": o.tube_a, "tube_b": o.tube_b}
+        return o
     defaults = {
         "name":"未命名方案","slot_count":12,"slots":[],
         "radius_mm":100.0,"rpm":4000.0,"w1":1.0,"w2":0.000001,
         "move_weight":0.0,"restarts":10,"chain_steps":2500,
-        "seed":20260923,"previous":None,"parent_id":None,"save":True,
+        "seed":20260923,"previous":None,"parent_id":None,
+        "mutex_pairs":[],"save":True,
     }
     merged = {**defaults, **data}
     return types.SimpleNamespace(
@@ -225,6 +234,7 @@ def _build_concrete(cls, data):
         restarts=int(merged["restarts"]), chain_steps=int(merged["chain_steps"]),
         seed=int(merged["seed"]),
         previous=([prev(d) for d in merged["previous"]] if merged["previous"] is not None else None),
+        mutex_pairs=[mpair(d) for d in merged["mutex_pairs"]],
         parent_id=merged["parent_id"], save=bool(merged.get("save", True)),
     )
 
@@ -782,4 +792,196 @@ assert call("GET", f"/api/plan/{evid2}")["result"]["metrics"]["u1_mag_g_mm"] == 
 assert call("GET", f"/api/plan/{evid3}")["result"]["metrics"]["u1_mag_g_mm"] == \
     recv3["result"]["metrics"]["u1_mag_g_mm"]
 print("slot-evacuation validation/read-only OK")
+
+# ---- 互斥试管隔离(精确完全枚举; 禁用槽仍占物理相邻关系) ----
+import itertools as _itx
+
+def mutex_plan_body(tubes, pairs, disabled=(), n_slots=12, **ov):
+    body = {
+        "name": "互斥方案", "slot_count": n_slots,
+        "slots": [{"index": i, "angle": 360.0 * i / n_slots,
+                   "enabled": i not in disabled} for i in range(n_slots)],
+        "tubes": tubes, "radius_mm": 100.0, "rpm": 4000,
+        "w1": 1.0, "w2": 1e-6, "restarts": 4, "chain_steps": 200,
+        "mutex_pairs": [{"tube_a": a, "tube_b": b} for a, b in pairs],
+    }
+    body.update(ov)
+    return body
+
+def brute_mutex(body):
+    """全排列参考: (最小评分, 管号升序槽位序列, 合法摆摆放数); 锁定管固定。"""
+    slots = body["slots"]
+    order = sorted(slots, key=lambda s: (s["angle"] % 360, s["index"]))
+    adj = {s["index"]: set() for s in slots}
+    for i, s in enumerate(order):
+        a, b = s["index"], order[(i + 1) % len(order)]["index"]
+        if a != b:
+            adj[a].add(b); adj[b].add(a)
+    pairs = [tuple(sorted((q["tube_a"], q["tube_b"]))) for q in body["mutex_pairs"]]
+    tubes = sorted(body["tubes"], key=lambda t: t["id"])
+    fix = {t["id"]: t["slot"] for t in tubes if t.get("locked")}
+    free_slots = [s["index"] for s in slots if s["enabled"] and s["index"] not in fix.values()]
+    free_t = [t for t in tubes if t["id"] not in fix]
+    # 锁定-锁定互斥相邻 -> 结构性不可行
+    for a, b in pairs:
+        if a in fix and b in fix and fix[b] in adj[fix[a]]:
+            return None, None, 0
+    best = None; bestkey = None; cnt = 0
+    for comb in _itx.permutations(free_slots, len(free_t)):
+        loc = dict(fix)
+        loc.update({free_t[i]["id"]: comb[i] for i in range(len(free_t))})
+        if any(loc[b] in adj[loc[a]] for a, b in pairs):
+            continue
+        cnt += 1
+        ux = uy = ux2 = uy2 = 0.0
+        for t in tubes:
+            a = _math.radians(360.0 * loc[t["id"]] / body["slot_count"])
+            m = t["mass"]
+            ux += m * _math.cos(a); uy += m * _math.sin(a)
+            ux2 += m * _math.cos(2 * a); uy2 += m * _math.sin(2 * a)
+        sc = (ux * ux + uy * uy) + 1e-6 * (ux2 * ux2 + uy2 * uy2)
+        key = tuple(loc[t["id"]] for t in tubes)
+        if best is None or sc < best - 1e-9 * max(1.0, abs(best)):
+            best, bestkey = sc, key
+        elif abs(sc - best) <= 1e-9 * max(1.0, abs(best)) and key < bestkey:
+            bestkey = key
+    return best, bestkey, cnt
+
+mx_tubes = [{"id": i, "mass": m} for i, m in
+            zip(range(1, 7), (50, 50, 51, 49, 30, 30))]
+mx_body = mutex_plan_body(mx_tubes, [(1, 2), (3, 4)], disabled=(10, 11))
+mx_rec = call("POST", "/api/plan", mx_body)
+assert mx_rec["id"], "互斥方案应正常保存"
+mx_r = mx_rec["result"]
+assert mx_r["config"]["variant"] == "exact-mutex"
+assert mx_r["config"]["mutex_pair_count"] == 2
+assert len(mx_r["exact_search"]["mutex_pairs"]) == 2
+mx_loc = {p["tube_id"]: p["slot"] for p in mx_r["placements"]}
+# 物理相邻关系: 禁用槽 10/11 仍占位, 9 与 0 不相邻
+mx_order = sorted(mx_body["slots"], key=lambda s: (s["angle"] % 360, s["index"]))
+mx_adj = {s["index"]: set() for s in mx_body["slots"]}
+for i, s in enumerate(mx_order):
+    a, b = s["index"], mx_order[(i + 1) % 12]["index"]
+    mx_adj[a].add(b); mx_adj[b].add(a)
+for a, b in ((1, 2), (3, 4)):
+    assert mx_loc[b] not in mx_adj[mx_loc[a]], (a, b, mx_loc)
+# 与全排列参考一致(最小评分 + 平分裁决 + 叶子数)
+bs, bkey, bcnt = brute_mutex(mx_body)
+assert mx_r["exact_search"]["evaluated_arrangements"] == bcnt
+key = tuple(mx_loc[t["id"]] for t in sorted(mx_body["tubes"], key=lambda t: t["id"]))
+assert key == bkey, (key, bkey)
+# 每支试管都带互斥搭档标注
+pw = {p["tube_id"]: p["mutex_with"] for p in mx_r["placements"]}
+assert pw[1] == [2] and pw[2] == [1] and pw[5] == []
+# 回放步骤末步与指标一致且互斥约束全程成立
+last_step = mx_r["steps"][-1]
+assert abs(last_step["vectors"]["u1_mag"] - mx_r["metrics"]["u1_mag_g_mm"]) < 1e-6
+for st in mx_r["steps"]:
+    sm = {p["tube_id"]: p["slot"] for p in st["placements"] if p["slot"] is not None}
+    for a, b in ((1, 2), (3, 4)):
+        if a in sm and b in sm:
+            assert sm[b] not in mx_adj[sm[a]], st["seq"]
+# 请求落库保留互斥对(结果回放/再载入)
+saved_req = call("GET", f"/api/plan/{mx_rec['id']}")["request"]
+assert [(q["tube_a"], q["tube_b"]) for q in saved_req["mutex_pairs"]] == [(1, 2), (3, 4)]
+print("mutex-pair exact search OK: evaluated=%d key=%s U1=%.3f" % (
+    bcnt, key, mx_r["metrics"]["u1_mag_g_mm"]))
+
+# 禁用槽占据物理相邻: 仅槽 0/2 启用(槽 1 禁用介于其间) -> 不相邻, 可行; 仅 0/1 -> 相邻, 不可行
+two_body = mutex_plan_body(
+    [{"id": 1, "mass": 50}, {"id": 2, "mass": 50}], [(1, 2)],
+    n_slots=12)
+two_body["slots"] = [{"index": i, "angle": i * 30, "enabled": i in (0, 2)}
+                     for i in range(12)]
+two_r = call("POST", "/api/plan", two_body)
+two_loc = {p["tube_id"]: p["slot"] for p in two_r["result"]["placements"]}
+assert set(two_loc.values()) == {0, 2}
+adj_body = mutex_plan_body(
+    [{"id": 1, "mass": 50}, {"id": 2, "mass": 50}], [(1, 2)], n_slots=12)
+adj_body["slots"] = [{"index": i, "angle": i * 30, "enabled": i in (0, 1)}
+                     for i in range(12)]
+try:
+    call("POST", "/api/plan", adj_body); raise SystemExit("should 400: no legal placement")
+except main.HTTPException as e:
+    assert e.status_code == 400 and "不可行" in e.detail, e.detail
+
+# 锁定-锁定互斥相邻 -> 400 且不保存; 无合法摆放 -> 400 且不保存
+n_before = len(call("GET", "/api/plans", )["items"])
+lock_conflict = mutex_plan_body(
+    [{"id": 1, "mass": 50, "locked": True, "slot": 0},
+     {"id": 2, "mass": 50, "locked": True, "slot": 1}], [(1, 2)],
+    disabled=(10, 11))
+try:
+    call("POST", "/api/plan", lock_conflict); raise SystemExit("should 400: locked conflict")
+except main.HTTPException as e:
+    assert e.status_code == 400 and "不可行" in e.detail, e.detail
+no_room = mutex_plan_body(
+    [{"id": 1, "mass": 50, "locked": True, "slot": 0},
+     {"id": 2, "mass": 50, "locked": True, "slot": 2},
+     {"id": 3, "mass": 50}], [(1, 3), (2, 3)], n_slots=3)
+no_room["slots"] = [{"index": i, "angle": i * 120, "enabled": True} for i in range(3)]
+try:
+    call("POST", "/api/plan", no_room); raise SystemExit("should 400: infeasible")
+except main.HTTPException as e:
+    assert e.status_code == 400 and "不可行" in e.detail, e.detail
+assert len(call("GET", "/api/plans")["items"]) == n_before, "不可行请求不得保存方案"
+
+# 限额: 8 管 / 11 启用槽 / 13 对 / 自互斥 / 重复对 / 未知管号 -> 400
+eight = mutex_plan_body([{"id": i, "mass": 10} for i in range(1, 9)], [(1, 2)],
+                        disabled=(10, 11))
+eleven = mutex_plan_body([{"id": 1, "mass": 10}, {"id": 2, "mass": 10}], [(1, 2)])
+eleven["slots"][11]["enabled"] = True
+thirteen = mutex_plan_body([{"id": i, "mass": 10} for i in range(1, 7)],
+                           [(1, 2)] * 13, disabled=(10, 11))
+self_pair = mutex_plan_body([{"id": 1, "mass": 10}, {"id": 2, "mass": 10}],
+                            [(1, 1)], disabled=(10, 11))
+dup_pair = mutex_plan_body([{"id": 1, "mass": 10}, {"id": 2, "mass": 10}],
+                           [(1, 2), (2, 1)], disabled=(10, 11))
+unknown = mutex_plan_body([{"id": 1, "mass": 10}, {"id": 2, "mass": 10}],
+                          [(1, 9)], disabled=(10, 11))
+for bad in (eight, eleven, thirteen, self_pair, dup_pair, unknown):
+    try:
+        call("POST", "/api/plan", bad); raise SystemExit("should 400: " + str(bad.get("mutex_pairs")))
+    except main.HTTPException as e:
+        assert e.status_code == 400, e
+print("mutex-pair validation/infeasible/not-saved OK")
+
+# 含互斥对的增量重排: 新增试管, 沿用质量/锁定/权重/增量输入, 结果仍精确最优
+inc_body = json.loads(json.dumps(mx_body))
+inc_body["name"] = "互斥增量方案"
+inc_body["tubes"].append({"id": 7, "mass": 20})
+inc_body["previous"] = [{"tube_id": p["tube_id"], "slot": p["slot"]}
+                        for p in mx_r["placements"]]
+inc_body["parent_id"] = mx_rec["id"]
+inc_rec = call("POST", "/api/plan", inc_body)
+inc_r = inc_rec["result"]
+assert inc_r["config"]["incremental"] is True
+assert inc_r["config"]["variant"] == "exact-mutex"
+bs2, bkey2, bcnt2 = brute_mutex(inc_body)
+inc_loc = {p["tube_id"]: p["slot"] for p in inc_r["placements"]}
+key2 = tuple(inc_loc[t["id"]] for t in sorted(inc_body["tubes"], key=lambda t: t["id"]))
+assert key2 == bkey2, (key2, bkey2)
+assert inc_r["exact_search"]["evaluated_arrangements"] == bcnt2
+# 增量输入保留: 未移动管沿用旧槽
+for p in inc_r["placements"]:
+    if p["tube_id"] != 7 and p["tube_id"] not in inc_r["moved_tube_ids"]:
+        old = next(q for q in mx_r["placements"] if q["tube_id"] == p["tube_id"])
+        assert p["slot"] == old["slot"]
+# 保存方案同样保留互斥对
+assert [(q["tube_a"], q["tube_b"])
+        for q in call("GET", f"/api/plan/{inc_rec['id']}")["request"]["mutex_pairs"]] == [(1, 2), (3, 4)]
+print("mutex-pair incremental OK: evaluated=%d moved=%s" % (
+    bcnt2, inc_r["moved_tube_ids"]))
+
+# 无互斥对: 请求缺省 mutex_pairs, 沿用启发式求解
+plain = dict(req_body)
+plain["name"] = "无互斥普通方案"
+plain["slots"] = [{"index": i, "angle": i * 30, "enabled": True} for i in range(12)]
+plain_rec = call("POST", "/api/plan", plain)
+assert "exact_search" not in plain_rec["result"]
+assert plain_rec["result"]["config"]["mutex_pair_count"] == 0
+assert plain_rec["request"]["mutex_pairs"] == []
+print("mutex-pair absent heuristic path OK")
+print("MUTEX SMOKE TESTS PASS")
+
 print("BACKEND SMOKE TESTS PASS")

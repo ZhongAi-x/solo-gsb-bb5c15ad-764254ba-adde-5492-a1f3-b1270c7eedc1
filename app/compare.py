@@ -145,6 +145,20 @@ def _tube_signature(req: dict[str, Any]) -> dict[int, dict[str, Any]]:
     }
 
 
+def _mutex_signature(req: dict[str, Any]) -> list[tuple[int, int]]:
+    """互斥对规范化(无序去重、按小编号优先排序), 旧方案缺省视为空。"""
+    pairs: set[tuple[int, int]] = set()
+    for item in req.get("mutex_pairs") or []:
+        if isinstance(item, dict):
+            a = item.get("tube_a", item.get("a"))
+            b = item.get("tube_b", item.get("b"))
+        else:
+            a, b = item[0], item[1]
+        a, b = int(a), int(b)
+        pairs.add((a, b) if a < b else (b, a))
+    return sorted(pairs)
+
+
 def _diff_entry(label: str, unit: str, ndigits: int,
                 va: Any, vb: Any) -> dict[str, Any]:
     return {
@@ -204,6 +218,17 @@ def compare_inputs(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
             continue
         if va is None or vb is None or not _same_num(va, vb):
             solver.append(_diff_entry(label, unit, ndigits, va, vb))
+
+    # 互斥试管隔离约束(影响可行域与最优性, 必须纳入同条件判定)
+    ma, mb = _mutex_signature(qa), _mutex_signature(qb)
+    if ma != mb:
+        solver.append({
+            "label": "互斥试管对",
+            "unit": "",
+            "ndigits": 0,
+            "value_a": ", ".join(f"{a}↔{b}" for a, b in ma) or "无",
+            "value_b": ", ".join(f"{a}↔{b}" for a, b in mb) or "无",
+        })
 
     # 试管清单差异(新增/移除/质量或锁定变化; 摆放槽位差异另由明细表体现)
     tubes: list[dict[str, Any]] = []
