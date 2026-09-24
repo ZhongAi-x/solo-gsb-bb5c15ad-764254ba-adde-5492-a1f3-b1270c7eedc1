@@ -56,6 +56,8 @@ th{color:var(--mut);font-weight:500}
 .pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;border:1px solid var(--line)}
 .pill.lock{color:var(--lock);border-color:var(--lock)}
 .pill.move{color:var(--warn);border-color:var(--warn)}
+.pill.mutex{color:#f472b6;border-color:#f472b6}
+.mutex-arc{stroke:#f472b6;stroke-width:1.6;stroke-dasharray:5 4;fill:none;opacity:.85}
 #rotor{width:100%;max-width:420px;display:block;margin:0 auto;background:radial-gradient(circle at 50% 45%,#1a2540,#101726);
   border-radius:12px;border:1px solid var(--line)}
 .slot-node{cursor:pointer}
@@ -135,7 +137,7 @@ th{color:var(--mut);font-weight:500}
     <h1>离心机转子配平规划器
       <span class="badge">FastAPI · SQLite</span>
     </h1>
-    <div class="sub">在质量与角度约束下搜索近似最优对称布局 · 合力矩 / 二阶不平衡量 · 锁定增量重排 · 步骤回放 · JSON 导出</div>
+    <div class="sub">在质量与角度约束下搜索近似最优对称布局 · 合力矩 / 二阶不平衡量 · 锁定增量重排 · 互斥试管物理非相邻精确搜索 · 步骤回放 · JSON 导出</div>
   </div>
   <div class="spacer"></div>
   <button id="btnSample">载入示例</button>
@@ -179,6 +181,18 @@ th{color:var(--mut);font-weight:500}
     </div>
 
     <div class="panel section">
+      <h2>互斥试管对 <span class="tag">至多 12 对; 每对不得落在物理相邻槽位(禁用槽仍占位)</span></h2>
+      <div id="mutexBox"></div>
+      <div class="rowline" style="margin-top:8px">
+        <button id="btnAddMutex">+ 添加互斥对</button>
+        <span class="small" id="mutexCount"></span>
+      </div>
+      <div class="small" style="margin-top:5px">含互斥对时限至多 <b>7 支试管、10 个启用槽</b>,
+        服务端对全部合法摆放做<b>精确搜索</b>取评分最小值, 平分按管号升序的槽位序列裁决;
+        无可行摆放或锁定管互斥冲突时明确返回不可行且不保存方案。</div>
+    </div>
+
+    <div class="panel section">
       <h2>求解 / 增量重排</h2>
       <div class="grid3">
         <div><label>一阶权重 w₁</label><input id="w1" type="number" step="any" value="1"></div>
@@ -217,6 +231,7 @@ th{color:var(--mut);font-weight:500}
           <span><i style="background:#141a28;border:1px dashed #2a3346"></i>禁用槽</span>
           <span><i style="background:var(--lock)"></i>锁定试管</span>
           <span><i style="background:var(--warn)"></i>本次移动</span>
+          <span><i style="background:#f472b6"></i>互斥试管对(非相邻)</span>
           <span><i style="background:var(--acc)"></i>一阶合力 U₁</span>
           <span><i style="background:var(--acc2)"></i>二阶 U₂</span>
         </div>
@@ -231,6 +246,7 @@ th{color:var(--mut);font-weight:500}
           <div class="metric"><div class="k">平衡评级</div><div class="v" id="mGrade">–</div></div>
         </div>
         <div id="summary" class="reason" style="margin-top:10px;display:none"></div>
+        <div id="mutexInfo" class="reason" style="margin-top:8px;display:none;border-left-color:#f472b6"></div>
       </div>
     </div>
 

@@ -5,6 +5,7 @@ const $ = (id) => document.getElementById(id);
 const state = {
   slots: [],            // {index, angle, enabled}
   tubes: [],            // {id, mass, locked, slot}
+  mutexPairs: [],       // {a, b} 互斥试管对
   result: null,         // 最新计算结果
   record: null,         // 含 id/name/request
   replay: { steps: [], pos: 0, timer: null },
@@ -114,6 +115,58 @@ function renderTubes() {
     tb.appendChild(tr);
   });
   $("tubeCount").textContent = `共 ${state.tubes.length} 支`;
+  renderMutexEditor();
+}
+
+// ---------------------------------------------------------------------------
+// 输入:互斥试管对
+// ---------------------------------------------------------------------------
+function addMutexPair(a = null, b = null) {
+  if (state.mutexPairs.length >= 12) { toast("至多录入 12 对互斥试管。", true); return; }
+  state.mutexPairs.push({ a, b });
+  renderMutexEditor();
+}
+
+function renderMutexEditor() {
+  const box = $("mutexBox");
+  box.innerHTML = "";
+  const opts = () => state.tubes.map((t) => `<option value="${t.id}">${t.id}</option>`).join("");
+  state.mutexPairs.forEach((mp, i) => {
+    const row = document.createElement("div");
+    row.className = "rowline";
+    row.style.cssText = "gap:6px;margin-bottom:5px;flex-wrap:wrap";
+    row.innerHTML = `
+      <span class="small">第 ${i + 1} 对</span>
+      <select data-f="a" style="width:70px"><option value="">—</option>${opts()}</select>
+      <span class="small">↔</span>
+      <select data-f="b" style="width:70px"><option value="">—</option>${opts()}</select>
+      <button class="iconbtn" data-act="del">删</button>`;
+    const sels = row.querySelectorAll("select");
+    sels[0].value = mp.a === null ? "" : mp.a;
+    sels[1].value = mp.b === null ? "" : mp.b;
+    sels[0].onchange = (e) => { mp.a = e.target.value === "" ? null : parseInt(e.target.value, 10); };
+    sels[1].onchange = (e) => { mp.b = e.target.value === "" ? null : parseInt(e.target.value, 10); };
+    row.querySelector('[data-act="del"]').onclick = () => {
+      state.mutexPairs.splice(i, 1);
+      renderMutexEditor();
+    };
+    box.appendChild(row);
+  });
+  $("mutexCount").textContent = `共 ${state.mutexPairs.length} / 12 对`;
+}
+
+function validateMutexPairs() {
+  const seen = new Set();
+  const ids = new Set(state.tubes.map((t) => t.id));
+  for (const mp of state.mutexPairs) {
+    if (mp.a === null || mp.b === null) return "存在未填完整的互斥试管对, 请补全或删除。";
+    if (mp.a === mp.b) return `互斥对 ${mp.a} ↔ ${mp.b} 的两支试管编号不能相同。`;
+    if (!ids.has(mp.a) || !ids.has(mp.b)) return `互斥对 ${mp.a} ↔ ${mp.b} 引用了不存在的试管。`;
+    const key = mp.a < mp.b ? `${mp.a}-${mp.b}` : `${mp.b}-${mp.a}`;
+    if (seen.has(key)) return `互斥试管对 ${mp.a} ↔ ${mp.b} 重复。`;
+    seen.add(key);
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +225,23 @@ function drawRotor(result, replayPlacements = null, replayVectors = null) {
         x1, y1, x2, y2,
         stroke: pr.opposite_deviation_deg <= 0.5 ? "#36d39955" : "#fbbd2344",
         "stroke-width": 1, "stroke-dasharray": "4 4",
+      }));
+    });
+  }
+
+  // 互斥试管对连线(粉红虚线; 精确搜索保证两者物理非相邻)
+  const mutexPairs = result?.mutex_pairs || [];
+  if (mutexPairs.length && placements) {
+    const slotOf = new Map(placements.filter((p) => p.slot !== null && p.slot !== undefined)
+      .map((p) => [p.tube_id, p.slot]));
+    mutexPairs.forEach((mp) => {
+      const sa = slotOf.get(mp.tube_a), sb = slotOf.get(mp.tube_b);
+      const a = state.slots[sa], b = state.slots[sb];
+      if (!a || !b) return;
+      const [x1, y1] = polar(210, 210, R, a.angle);
+      const [x2, y2] = polar(210, 210, R, b.angle);
+      svg.appendChild(el("line", {
+        x1, y1, x2, y2, class: "mutex-arc",
       }));
     });
   }
@@ -263,8 +333,28 @@ function renderResult(record) {
 
   drawRotor(r);
   renderPairs(r);
+  renderMutexInfo(r);
   renderPlacements(r);
   initReplay(r);
+}
+
+function renderMutexInfo(r) {
+  const box = $("mutexInfo");
+  const pairs = r.mutex_pairs || [];
+  if (!pairs.length) { box.style.display = "none"; box.innerHTML = ""; return; }
+  const ex = r.exact_search || {};
+  const tags = pairs.map((mp) =>
+    `<span class="pill mutex">试管 ${mp.tube_a} ↔ 试管 ${mp.tube_b}</span>`).join(" ");
+  box.innerHTML = `<div class="rhead" style="color:#f472b6;font-weight:600;font-size:11.5px;margin-bottom:3px">
+      互斥试管隔离 · 精确搜索</div>
+    <div class="rowline" style="gap:6px;flex-wrap:wrap">${tags}</div>
+    <div class="small" style="margin-top:4px">
+      每对互斥试管均不落在按角度环形排序后相邻的物理槽位(禁用槽仍占据相邻关系);
+      共评估合法摆放 <b>${ex.legal_arrangements ?? "–"}</b> 种
+      (全部槽位分配 ${ex.total_arrangements ?? "–"} 种),
+      在现有评分(质量/权重/移动罚)下精确取最小值, 平分时按管号升序的槽位序列裁决。
+    </div>`;
+  box.style.display = "block";
 }
 
 function renderPairs(r) {
@@ -328,7 +418,7 @@ function showReplayStep() {
   const step = steps[pos];
   $("rpPos").textContent = `${pos + 1}/${steps.length}`;
   $("rpRange").value = pos;
-  const kindMap = { init: "初始", pair: "配对", single: "补偿", refine: "微调优化" };
+  const kindMap = { init: "初始", pair: "配对", single: "补偿", refine: "微调优化", exact: "精确搜索" };
   $("stepReason").innerHTML =
     `<span class="badge">${kindMap[step.kind] || step.kind} · 步骤 ${pos + 1}</span> ${step.reason}
      <div class="small" style="margin-top:4px">此步后: |U₁|=${fmt(step.vectors.u1_mag)} g·mm,
@@ -375,6 +465,9 @@ function buildRequest() {
     move_weight: parseFloat($("moveWeight").value),
     restarts: parseInt($("restarts").value),
     chain_steps: parseInt($("chainSteps").value),
+    mutex_pairs: state.mutexPairs
+      .filter((mp) => mp.a !== null && mp.b !== null)
+      .map((mp) => ({ tube_a: mp.a, tube_b: mp.b })),
   };
   if ($("incremental").checked && state.result) {
     req.previous = state.result.placements
@@ -396,6 +489,12 @@ async function compute() {
   }
   const enabled = state.slots.filter((s) => s.enabled).length;
   if (state.tubes.length > enabled) { toast(`试管数(${state.tubes.length})超过可用槽位数(${enabled})。`, true); return; }
+  const mutexErr = validateMutexPairs();
+  if (mutexErr) { toast(mutexErr, true); return; }
+  if (state.mutexPairs.length) {
+    if (state.tubes.length > 7) { toast("含互斥对的请求至多 7 支试管。", true); return; }
+    if (enabled > 10) { toast("含互斥对的请求至多 10 个启用槽, 请禁用部分槽位。", true); return; }
+  }
 
   $("btnPlan").disabled = true;
   $("btnPlan").textContent = "计算中…";
@@ -707,13 +806,14 @@ async function loadPlan(id) {
   $("planName").value = data.name;
   state.slots = q.slots.map((s) => ({ ...s }));
   state.tubes = q.tubes.map((t) => ({ ...t }));
+  state.mutexPairs = (q.mutex_pairs || []).map((mp) => ({ a: mp.tube_a, b: mp.tube_b }));
   state.nextTubeId = Math.max(0, ...state.tubes.map((t) => t.id)) + 1;
   $("slotCount").value = q.slot_count;
   $("radius").value = q.radius_mm; $("rpm").value = q.rpm;
   $("w1").value = q.w1; $("w2").value = q.w2;
   $("moveWeight").value = q.move_weight;
   $("restarts").value = q.restarts; $("chainSteps").value = q.chain_steps;
-  renderSlotEditor(); renderTubes();
+  renderSlotEditor(); renderTubes(); renderMutexEditor();
   renderResult({ id: data.id, name: data.name, request: q, result: data.result });
   $("historyDialog").classList.remove("open");
   toast(`已载入方案 #${id}。`);
@@ -1371,6 +1471,7 @@ document.querySelectorAll(".tabs button").forEach((b) => {
 $("btnGenSlots").onclick = genSlots;
 $("slotCount").onchange = genSlots;
 $("btnAddTube").onclick = () => addTube();
+$("btnAddMutex").onclick = () => addMutexPair();
 
 function loadSample() {
   $("slotCount").value = 12;
@@ -1378,6 +1479,7 @@ function loadSample() {
   $("planName").value = "示例: 6 支非等质量试管";
   genSlots();
   state.tubes = [];
+  state.mutexPairs = [];
   state.nextTubeId = 1;
   [[50], [50], [51], [49], [30], [30]].forEach(([mass]) => addTube({ mass }));
   renderTubes();

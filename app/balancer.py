@@ -21,6 +21,13 @@ from typing import Any, Optional
 
 TWO_PI = 2.0 * math.pi
 
+# 互斥试管隔离(精确搜索)的规模上限
+MUTEX_MAX_PAIRS = 12
+MUTEX_MAX_TUBES = 7
+MUTEX_MAX_ENABLED_SLOTS = 10
+# 并列评分的数值容差(与 app/evacuation.py 一致)
+_SCORE_TOL = 1e-9
+
 
 # ---------------------------------------------------------------------------
 # 几何工具
@@ -45,6 +52,22 @@ def opposite_deviation(a: float, b: float) -> float:
     return abs(abs(signed_angle_diff(a, b)) - 180.0)
 
 
+def ring_adjacent_slots(slots: list[Slot]) -> set[frozenset[int]]:
+    """按角度环形排序后的物理相邻槽位对(含首尾环绕)。
+
+    禁用槽仍参与环形排序并占据物理相邻关系: 两个启用槽之间若隔着禁用槽,
+    它们在环上不相邻。同角度槽位以槽号为次序键, 同角度槽彼此相邻。
+    """
+    order = sorted(slots, key=lambda s: (s.angle % 360.0, s.index))
+    adj: set[frozenset[int]] = set()
+    m = len(order)
+    for i in range(m):
+        j = (i + 1) % m
+        if i != j:  # 单槽时不与自身相邻
+            adj.add(frozenset((order[i].index, order[j].index)))
+    return adj
+
+
 # ---------------------------------------------------------------------------
 # 数据模型
 # ---------------------------------------------------------------------------
@@ -63,10 +86,18 @@ class Tube:
     slot: Optional[int] = None   # 锁定试管的固定槽位; 非锁定为 None
 
 
+@dataclass(frozen=True)
+class MutexPair:
+    """互斥试管对: 两支试管不得落在按角度环形排序后相邻的物理槽位。"""
+    a: int
+    b: int
+
+
 @dataclass
 class Solver:
     slots: list[Slot]
     tubes: list[Tube]
+    mutex_pairs: list[MutexPair] = field(default_factory=list)
     radius_mm: float = 100.0
     rpm: float = 4000.0
     w1: float = 1.0             # 一阶不平衡量目标权重(主导)
@@ -89,6 +120,8 @@ class Solver:
     _track_best: float = math.inf
     _anneal_recorded: int = 0
     _anneal_record_cap: int = 24
+    # 互斥精确搜索的统计(仅含互斥对时填充)
+    _exact: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._chain_steps = self.chain_steps
@@ -138,6 +171,50 @@ class Solver:
             )
         if self.radius_mm <= 0 or self.rpm < 0:
             raise ValueError("半径必须为正, 转速不能为负。")
+        # —— 互斥试管对 ——
+        self._validate_mutex_pairs(enabled)
+
+    def _validate_mutex_pairs(self, enabled: set[int]) -> None:
+        if not self.mutex_pairs:
+            return
+        if len(self.mutex_pairs) > MUTEX_MAX_PAIRS:
+            raise ValueError(
+                f"互斥试管对至多 {MUTEX_MAX_PAIRS} 对(当前 {len(self.mutex_pairs)} 对)。"
+            )
+        if len(self.tubes) > MUTEX_MAX_TUBES:
+            raise ValueError(
+                f"含互斥对的请求至多 {MUTEX_MAX_TUBES} 支试管"
+                f"(当前 {len(self.tubes)} 支), 精确搜索规模受限。"
+            )
+        if len(enabled) > MUTEX_MAX_ENABLED_SLOTS:
+            raise ValueError(
+                f"含互斥对的请求至多 {MUTEX_MAX_ENABLED_SLOTS} 个启用槽"
+                f"(当前 {len(enabled)} 个), 精确搜索规模受限。"
+            )
+        ids = {t.id for t in self.tubes}
+        seen: set[frozenset[int]] = set()
+        for mp in self.mutex_pairs:
+            if mp.a == mp.b:
+                raise ValueError(f"互斥试管对的两支试管编号不能相同({mp.a})。")
+            if mp.a not in ids or mp.b not in ids:
+                raise ValueError(
+                    f"互斥试管对 ({mp.a}, {mp.b}) 引用了不存在的试管编号。"
+                )
+            key = frozenset((mp.a, mp.b))
+            if key in seen:
+                raise ValueError(f"互斥试管对 ({min(mp.a, mp.b)}, {max(mp.a, mp.b)}) 重复。")
+            seen.add(key)
+        # 锁定管互斥冲突: 两支都锁定且固定槽在物理环上相邻 → 结构上不可行
+        locked_slot = {t.id: t.slot for t in self.tubes if t.locked}
+        adj = ring_adjacent_slots(self.slots)
+        for mp in self.mutex_pairs:
+            if mp.a in locked_slot and mp.b in locked_slot:
+                if frozenset((locked_slot[mp.a], locked_slot[mp.b])) in adj:
+                    raise ValueError(
+                        f"不可行: 互斥试管 {mp.a} 与 {mp.b} 均已锁定, "
+                        f"而锁定槽位 {locked_slot[mp.a]} 与 {locked_slot[mp.b]} "
+                        "在按角度环形排序后相邻(禁用槽仍占据相邻关系)。"
+                    )
 
     # ------------------------------------------------------------------
     # 复向量
@@ -622,6 +699,9 @@ class Solver:
             for t in self.tubes:
                 self._origin[t.id] = prev_map.get(t.id) if not t.locked else None
 
+        if self.mutex_pairs:
+            return self._solve_mutex_exact(previous)
+
         free_cnt = len([t for t in self.tubes if not t.locked])
         greedy_variants = list(range(self.GREEDY_VARIANTS + 1))
         random_variants = list(range(self.GREEDY_VARIANTS + 1, self.restarts + 1))
@@ -663,6 +743,219 @@ class Solver:
         incremental = previous is not None
         return self._build_result(best_variant if best_variant is not None else 0,
                                   incremental, previous)
+
+    # ------------------------------------------------------------------
+    # 互斥试管隔离: 全排列精确搜索(管 ≤ 7、启用槽 ≤ 10)
+    # ------------------------------------------------------------------
+    def _solve_mutex_exact(self,
+                           previous: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
+        """对全部合法摆放做精确枚举, 取现有评分最小值。
+
+        合法摆放: 每支非锁定试管占据互不相同的启用槽, 且每对互斥试管所在槽位
+        在按角度环形排序的物理邻接图上不相邻(禁用槽仍占据相邻关系)。
+        评分沿用 w1·|U1|² + w2·|U2|² + move_weight·移动管数;
+        容差内平分时按管号升序的槽位序列(字典序)裁决。
+        """
+        incremental = previous is not None
+        self._reset()
+        self._exact = {}
+
+        adj = ring_adjacent_slots(self.slots)
+        enabled_idx = sorted(s.index for s in self.slots if s.enabled)
+        pos_of = {s: k for k, s in enumerate(enabled_idx)}
+
+        free_tubes = sorted(
+            (t for t in self.tubes if not t.locked), key=lambda t: t.id
+        )
+        free_ids = [t.id for t in free_tubes]
+        locked_ids = sorted(t.id for t in self.tubes if t.locked)
+
+        # 锁定试管先落位(其合法/不冲突已在 validate 中保证)
+        self._place_locked(record=False)
+        locked_occ = set(self._loc.values())
+
+        n_free = len(free_ids)
+        n_slots = len(enabled_idx)
+        n_free_slots = n_slots - len(locked_occ)
+        # 全部槽位分配(不考虑互斥): P(空闲启用槽, 非锁定管数)
+        total = (
+            math.comb(n_free_slots, n_free) * math.factorial(n_free)
+            if n_free else 1
+        )
+        adj_pos: list[list[int]] = [[] for _ in range(n_slots)]
+        for pair in adj:
+            x, y = tuple(pair)
+            if x in pos_of and y in pos_of:
+                px, py = pos_of[x], pos_of[y]
+                adj_pos[px].append(py)
+                adj_pos[py].append(px)
+        idx_of_tube = {tid: k for k, tid in enumerate(free_ids)}
+        mutex_of: dict[int, list[int]] = {}
+        for mp in self.mutex_pairs:
+            mutex_of.setdefault(mp.a, []).append(mp.b)
+            mutex_of.setdefault(mp.b, []).append(mp.a)
+
+        # 锁定槽占用掩码 + 与锁定互斥搭档相邻的静态禁用位置掩码
+        locked_pos_mask = 0
+        locked_static_adj = [0] * n_free
+        locked_slot_by_id = {t.id: t.slot for t in self.tubes if t.locked}
+        for s in locked_occ:
+            locked_pos_mask |= 1 << pos_of[s]
+        for k, tid in enumerate(free_ids):
+            for other in mutex_of.get(tid, []):
+                if other in locked_slot_by_id:
+                    lp = pos_of[locked_slot_by_id[other]]
+                    locked_static_adj[k] |= 1 << lp
+                    for q in adj_pos[lp]:
+                        locked_static_adj[k] |= 1 << q
+
+        # 预计算各管在各启用槽的一/二阶向量
+        v1 = [[0j] * n_slots for _ in range(n_free)]
+        v2 = [[0j] * n_slots for _ in range(n_free)]
+        for k, tid in enumerate(free_ids):
+            m = self._by_id[tid].mass
+            for p, sidx in enumerate(enabled_idx):
+                v1[k][p] = self._c1(sidx, m)
+                v2[k][p] = self._c2(sidx, m)
+        base_u1 = complex(self._u1)
+        base_u2 = complex(self._u2)
+        mw = self.move_weight
+        # 增量重排: 各管放到各启用槽的移动罚增量
+        move_add = [[0] * n_slots for _ in range(n_free)]
+        if mw:
+            for k, tid in enumerate(free_ids):
+                origin = self._origin.get(tid)
+                if origin is None:
+                    continue
+                for p, sidx in enumerate(enabled_idx):
+                    if sidx != origin:
+                        move_add[k][p] = mw
+        w1, w2 = self.w1, self.w2
+
+        # 允许位掩码(启用且未被锁定占用); 每个位置的物理相邻位掩码
+        allowed_mask = ((1 << n_slots) - 1) ^ locked_pos_mask
+        adj_mask = [0] * n_slots
+        for px in range(n_slots):
+            for py in adj_pos[px]:
+                adj_mask[px] |= 1 << py
+        # free→free 互斥搭档索引列表
+        mutex_peer = [[] for _ in range(n_free)]
+        for k, tid in enumerate(free_ids):
+            for other in mutex_of.get(tid, []):
+                oj = idx_of_tube.get(other)
+                if oj is not None:
+                    mutex_peer[k].append(oj)
+
+        leaves = 0
+        best_score = math.inf
+        best_key: Optional[tuple[int, ...]] = None
+        tie_count = 0
+        assign = [-1] * n_free
+        v1k, v2k, mak = v1, v2, move_add  # 局部别名, 减少闭包查找
+
+        def dfs(k: int, occ: int, u1: complex, u2: complex,
+                move_pen: float, final_best: float) -> None:
+            """枚举第 k.. 支试管的放法。final_best 为 inf 时第一遍求最小分;
+            否则只统计容差带内的并列并裁决槽位序列(管号升序字典序)。"""
+            nonlocal leaves, best_score, best_key, tie_count
+            if k == n_free:
+                sc = (
+                    w1 * (u1.real * u1.real + u1.imag * u1.imag)
+                    + w2 * (u2.real * u2.real + u2.imag * u2.imag)
+                    + move_pen
+                )
+                if final_best == math.inf:
+                    leaves += 1
+                    if sc < best_score:
+                        best_score = sc
+                elif sc <= final_best:
+                    tie_count += 1
+                    key = tuple(enabled_idx[p] for p in assign)
+                    if best_key is None or key < best_key:
+                        best_key = key
+                return
+            # 禁用位: 锁定互斥搭档相邻位 + 已放置(free)互斥搭档相邻位
+            forb = locked_static_adj[k]
+            for oj in mutex_peer[k]:
+                if oj < k:
+                    forb |= adj_mask[assign[oj]]
+            cands = allowed_mask & ~occ & ~forb
+            while cands:
+                bit = cands & -cands
+                cands ^= bit
+                p = bit.bit_length() - 1
+                assign[k] = p
+                dfs(k + 1, occ | bit, u1 + v1k[k][p], u2 + v2k[k][p],
+                    move_pen + mak[k][p], final_best)
+                assign[k] = -1
+
+        if n_free:
+            dfs(0, 0, base_u1, base_u2, 0.0, math.inf)
+            if leaves:
+                tie_band = best_score + _SCORE_TOL * max(1.0, best_score)
+                dfs(0, 0, base_u1, base_u2, 0.0, tie_band)
+        else:
+            leaves = 1
+            best_score = self._score(self._u1, self._u2, self._loc)
+            best_key = ()
+            tie_count = 1
+
+        self._exact = {
+            "legal_arrangements": leaves,
+            "optimal_arrangement_count": tie_count,
+            "total_arrangements": total,
+            "mutex_pair_count": len(self.mutex_pairs),
+            "enabled_slot_count": n_slots,
+            "tie_broken": tie_count > 1,
+        }
+
+        if leaves == 0:
+            pair_txt = "、".join(
+                f"({mp.a},{mp.b})" for mp in self.mutex_pairs
+            )
+            raise ValueError(
+                f"不可行: 在互斥试管对 {pair_txt} 的物理相邻隔离约束下"
+                f"(禁用槽仍占据相邻关系), {n_free} 支非锁定试管无法在 "
+                f"{n_slots} 个启用槽中合法摆放; 共枚举 {total} 种摆放, "
+                "无一满足全部互斥约束。"
+            )
+
+        # 用裁决得到的最优槽位序列重建状态并记录回放
+        assert best_key is not None
+        for tid in free_ids:
+            self._loc.pop(tid, None)
+        self._enc = {v: k for k, v in self._loc.items()}
+        self._u1, self._u2 = base_u1, base_u2
+        self._track = True
+        self._steps = []
+        if n_free:
+            placed = ", ".join(
+                f"试管 {tid}→槽 {slot}" for tid, slot in zip(free_ids, best_key)
+            )
+            self._snapshot(
+                "exact", None,
+                f"互斥隔离精确搜索: 锁定试管 {len(locked_ids)} 支先行落位"
+                + (f"({', '.join(map(str, locked_ids))}), " if locked_ids else ", ")
+                + f"对 {len(self.mutex_pairs)} 对互斥试管强制物理非相邻"
+                "(相邻关系按角度环形排序, 禁用槽仍占位); "
+                + f"在 {total} 种槽位分配中, {leaves} 种合法, "
+                f"已按现有评分精确取最小值。",
+            )
+            for tid, slot in zip(free_ids, best_key):
+                self._place(tid, slot)
+            self._snapshot(
+                "exact", free_ids,
+                f"精确最优摆放: {placed}; 评分容差内平分时已按管号升序的"
+                "槽位序列(字典序)裁决。",
+            )
+        else:
+            self._snapshot(
+                "exact", None,
+                f"全部 {len(locked_ids)} 支试管均为锁定试管, 无需搜索; "
+                f"已验证 {len(self.mutex_pairs)} 对互斥试管均不物理相邻。",
+            )
+
+        return self._build_result("mutex_exact", incremental, previous)
 
     # ------------------------------------------------------------------
     # 结果组装
@@ -710,6 +1003,11 @@ class Solver:
                 "locked": (self._by_id[tid].locked if tid is not None else False),
             })
 
+        mutex_out = [
+            {"tube_a": mp.a, "tube_b": mp.b}
+            for mp in sorted(self.mutex_pairs, key=lambda x: (x.a, x.b))
+        ]
+
         return {
             "config": {
                 "slot_count": len(self.slots),
@@ -720,12 +1018,15 @@ class Solver:
                 "move_weight": self.move_weight,
                 "variant": variant,
                 "incremental": incremental,
+                "exact_mutex": bool(self.mutex_pairs),
             },
             "metrics": metrics,
             "placements": placements,
             "slot_state": slot_state,
             "pairs": pairs,
             "singletons": singletons,
+            "mutex_pairs": mutex_out,
+            "exact_search": (dict(self._exact) if self._exact else None),
             "summary": self._summary_text(metrics, pairs, singletons, incremental, moved_ids),
             "moved_tube_ids": moved_ids,
             "steps": self._steps,
@@ -900,6 +1201,15 @@ class Solver:
                 f"增量重排: 共移动 {len(moved_ids)} 支非锁定试管"
                 + (f"(编号 {', '.join(map(str, moved_ids))})。" if moved_ids else ", 原布局完全保留。")
             )
+        if self.mutex_pairs:
+            ex = self._exact or {}
+            pair_txt = "、".join(f"({mp.a},{mp.b})" for mp in self.mutex_pairs)
+            lines.append(
+                f"互斥隔离(精确搜索): 互斥试管对 {pair_txt} 均不落在物理相邻槽位"
+                f"(禁用槽仍占据相邻关系); 共评估 {ex.get('legal_arrangements', 0)} 种合法摆放"
+                f"(全部槽位分配 {ex.get('total_arrangements', 0)} 种), "
+                "取现有评分最小值, 平分时按管号升序的槽位序列裁决。"
+            )
         return " ".join(lines)
 
 
@@ -922,9 +1232,14 @@ def run_plan(payload: dict[str, Any]) -> dict[str, Any]:
         )
         for t in payload["tubes"]
     ]
+    mutex_pairs = [
+        MutexPair(a=int(mp["tube_a"]), b=int(mp["tube_b"]))
+        for mp in payload.get("mutex_pairs", []) or []
+    ]
     solver = Solver(
         slots=slots,
         tubes=tubes,
+        mutex_pairs=mutex_pairs,
         radius_mm=float(payload.get("radius_mm", 100.0)),
         rpm=float(payload.get("rpm", 4000.0)),
         w1=float(payload.get("w1", 1.0)),

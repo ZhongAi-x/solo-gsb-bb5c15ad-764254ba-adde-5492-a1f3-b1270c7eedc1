@@ -207,11 +207,16 @@ def _build_concrete(cls, data):
         o = types.SimpleNamespace(tube_id=int(d["tube_id"]), slot=int(d["slot"]))
         o.model_dump = lambda: {"tube_id": o.tube_id, "slot": o.slot}
         return o
+    def mpair(d):
+        o = types.SimpleNamespace(tube_a=int(d["tube_a"]), tube_b=int(d["tube_b"]))
+        o.model_dump = lambda: {"tube_a": o.tube_a, "tube_b": o.tube_b}
+        return o
     defaults = {
         "name":"未命名方案","slot_count":12,"slots":[],
         "radius_mm":100.0,"rpm":4000.0,"w1":1.0,"w2":0.000001,
         "move_weight":0.0,"restarts":10,"chain_steps":2500,
-        "seed":20260923,"previous":None,"parent_id":None,"save":True,
+        "seed":20260923,"previous":None,"mutex_pairs":[],
+        "parent_id":None,"save":True,
     }
     merged = {**defaults, **data}
     return types.SimpleNamespace(
@@ -225,6 +230,7 @@ def _build_concrete(cls, data):
         restarts=int(merged["restarts"]), chain_steps=int(merged["chain_steps"]),
         seed=int(merged["seed"]),
         previous=([prev(d) for d in merged["previous"]] if merged["previous"] is not None else None),
+        mutex_pairs=[mpair(d) for d in merged.get("mutex_pairs", [])],
         parent_id=merged["parent_id"], save=bool(merged.get("save", True)),
     )
 
@@ -479,6 +485,71 @@ perf["slots"]=[{"index":i,"angle":i*30,"enabled":True} for i in range(12)]
 rp=call("POST","/api/plan",perf)
 assert rp["result"]["metrics"]["u1_mag_g_mm"]<1e-6
 print("perfect balance U1=0 OK")
+
+# ---- 互斥试管隔离(精确搜索, 保存/回放须保留互斥对) ----
+def _ring_adjacent(slot_list):
+    order=sorted(slot_list,key=lambda s:(s["angle"]%360.0,s["index"]))
+    adj=set()
+    for i in range(len(order)):
+        adj.add(frozenset((order[i]["index"],order[(i+1)%len(order)]["index"])))
+    return adj
+mx_body={
+    "name":"互斥方案","slot_count":10,
+    "slots":[{"index":i,"angle":i*36,"enabled":True} for i in range(10)],
+    "tubes":[{"id":i,"mass":50.0} for i in range(1,5)],
+    "mutex_pairs":[{"tube_a":1,"tube_b":3}],
+    "radius_mm":100.0,"rpm":4000.0,
+}
+mx=call("POST","/api/plan",mx_body)
+mxloc={p["tube_id"]:p["slot"] for p in mx["result"]["placements"]}
+_adj=_ring_adjacent(mx_body["slots"])
+assert frozenset((mxloc[1],mxloc[3])) not in _adj
+assert mx["result"]["config"]["exact_mutex"] is True
+assert mx["result"]["mutex_pairs"]==[{"tube_a":1,"tube_b":3}]
+assert mx["result"]["exact_search"]["legal_arrangements"]>0
+assert mx["result"]["exact_search"]["optimal_arrangement_count"]>=1
+assert all(s["placements"] for s in mx["result"]["steps"])
+# 保存后回读: 请求与结果均保留互斥对
+mxg=call("GET",f"/api/plan/{mx['id']}")
+assert mxg["request"]["mutex_pairs"]==[{"tube_a":1,"tube_b":3}]
+assert mxg["result"]["mutex_pairs"]==[{"tube_a":1,"tube_b":3}]
+n_plans_before=len(call("GET","/api/plans")["items"])
+# 无合法摆放 -> 400, 不落库
+mx_bad=dict(mx_body); mx_bad["slot_count"]=3
+mx_bad["slots"]=[{"index":i,"angle":i*120,"enabled":True} for i in range(3)]
+mx_bad["tubes"]=[{"id":i,"mass":50.0} for i in range(1,4)]
+mx_bad["mutex_pairs"]=[{"tube_a":1,"tube_b":2}]
+try:
+    call("POST","/api/plan",mx_bad); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code==400 and "不可行" in e.detail
+assert len(call("GET","/api/plans")["items"])==n_plans_before
+# 锁定管互斥冲突 -> 400, 不落库
+mx_lock=dict(mx_body)
+mx_lock["tubes"]=[{"id":1,"mass":50.0,"locked":True,"slot":0},
+                  {"id":2,"mass":50.0,"locked":True,"slot":1},
+                  {"id":3,"mass":50.0},{"id":4,"mass":50.0}]
+mx_lock["mutex_pairs"]=[{"tube_a":1,"tube_b":2}]
+try:
+    call("POST","/api/plan",mx_lock); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code==400 and "不可行" in e.detail
+assert len(call("GET","/api/plans")["items"])==n_plans_before
+# 禁用槽仍占据相邻: 4 槽中槽 1 禁用, 0/2 不相邻
+mx_dis=dict(mx_body); mx_dis["slot_count"]=4
+mx_dis["slots"]=[
+    {"index":0,"angle":0.0,"enabled":True},
+    {"index":1,"angle":30.0,"enabled":False},
+    {"index":2,"angle":60.0,"enabled":True},
+    {"index":3,"angle":90.0,"enabled":True},
+]
+mx_dis["tubes"]=[{"id":1,"mass":50.0},{"id":2,"mass":50.0}]
+mx_dis["mutex_pairs"]=[{"tube_a":1,"tube_b":2}]
+mxd=call("POST","/api/plan",mx_dis)
+dsl=sorted(p["slot"] for p in mxd["result"]["placements"])
+assert dsl==[0,2], dsl
+print("mutex exact-search/save/400-no-save OK")
+
 
 # ---- 批次换装顺序(只读, Held-Karp 精确求序) ----
 import itertools as _it
